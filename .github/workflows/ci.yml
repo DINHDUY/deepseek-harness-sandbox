@@ -1,0 +1,92 @@
+name: ci
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      # The lockfile is the source of truth: `npm ci` fails if it disagrees with
+      # package.json, which is what keeps the pinned tree reproducible.
+      - name: Install pinned dependencies
+        run: npm ci --omit=dev --ignore-scripts
+      - name: Audit pinned tree
+        run: npm audit --omit=dev --audit-level=high
+
+  quadlet:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Validate the units against a real quadlet generator. --dryrun only prints
+      # the generated units, it does not start anything.
+      - name: Validate Quadlet units
+        run: |
+          mkdir -p ~/.config/containers/systemd
+          cp quadlet/*.container quadlet/*.volume ~/.config/containers/systemd/
+          out=$(/usr/libexec/podman/quadlet --user --dryrun 2>&1 | grep -iE 'unsupported|error' || true)
+          if [ -n "$out" ]; then echo "$out"; exit 1; fi
+          echo "quadlet units OK"
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck -x scripts/*.sh
+      - name: hadolint Containerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Containerfile
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # Fails on any API key, token, or private key committed to history.
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build:
+    needs: [supply-chain, quadlet]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # GitHub's runners have docker, not podman; the Containerfile is portable.
+      - name: Build image
+        run: make build PODMAN=docker IMAGE=localhost/deepseek-harness:ci
+      - name: Smoke test the built image
+        run: |
+          # The entrypoint must fail closed (refuse to start) when it cannot
+          # resolve a usable container IP, rather than binding a wildcard.
+          out=$(docker run --rm --network none localhost/deepseek-harness:ci web 2>&1 || true)
+          echo "$out"
+          if ! echo "$out" | grep -q 'refusing to start'; then
+            echo "::error::entrypoint did not fail closed without a network"; exit 1
+          fi
+          docker run --rm localhost/deepseek-harness:ci --version
+      - name: Verify base-image digest pin is current
+        run: |
+          pin=$(sed -n 's|^ARG NODE_IMAGE=docker\.io/library/node:24-slim@\(sha256:[0-9a-f]*\).*|\1|p' Containerfile)
+          test -n "$pin" || { echo "::error::Containerfile base image is not digest-pinned"; exit 1; }
+          docker pull docker.io/library/node:24-slim
+          live=$(docker image inspect docker.io/library/node:24-slim --format '{{join .RepoDigests "\n"}}' | head -1 | sed 's/.*@//')
+          echo "Containerfile pin: $pin"
+          echo "live tag digest:   $live"
+          if [ "$pin" != "$live" ]; then
+            echo "::error::Containerfile base pin is stale. Run 'make digest-check' and update the pin."
+            exit 1
+          fi

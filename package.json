@@ -1,0 +1,23 @@
+{
+  "name": "deepseek-harness-sandbox",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Rootless Podman packaging for the DeepSeek Harness (dsh) agent. Not published.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=24.9.0"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh": "0.2.2-rc.1"
+  },
+  "overrides": {
+    "undici": "^8.12.4",
+    "zod": "^4.6.7",
+    "fflate": "^0.8.3",
+    "@modelcontextprotocol/client": "^2.3.0"
+  },
+  "scripts": {
+    "lock": "npm install --package-lock-only --ignore-scripts",
+    "audit:ci": "npm audit --omit=dev --audit-level=high"
+  }
+}

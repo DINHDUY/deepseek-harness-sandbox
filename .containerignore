@@ -1,0 +1,7 @@
+.git
+data/
+quadlet/
+*.md
+podman-compose.yml
+.tmp-*
+node_modules/

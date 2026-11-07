@@ -1,0 +1,17 @@
+# Agent state lives in named Podman volumes (deepseek-harness-dev-data /
+# -prod-data), never in the repo. If you ever bind-mount it for debugging, ignore it.
+data/
+
+# Secrets. API keys belong in your shell environment or in
+# ~/.config/deepseek-harness/env (chmod 600), never in the repo.
+.env
+.env.*
+*.env
+secrets/
+*.pem
+*.key
+
+# Local scratch and build leftovers
+node_modules/
+.tmp-*/
+*.log

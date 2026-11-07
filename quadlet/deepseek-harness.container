@@ -1,0 +1,58 @@
+[Unit]
+Description=deepseek-harness container (dsh web)
+After=network-online.target
+
+[Container]
+ContainerName=deepseek-harness
+Image=localhost/deepseek-harness:latest
+# Created by `make quadlet-net` with the egress blackhole routes. Quadlet has no
+# Route= key, so the network must exist beforehand; if it is missing the service
+# fails instead of falling back to the unisolated `podman` bridge.
+Network=deepseek-harness-net
+PublishPort=127.0.0.1:8080:8080
+Volume=deepseek-harness-prod-data.volume:/home/dshuser/data
+# KEY=value lines, e.g. DEEPSEEK_API_KEY=...; keep it chmod 600 and out of git
+EnvironmentFile=%h/.config/deepseek-harness/env
+
+# Hardening parity with `make sandbox-run`. This Podman's Quadlet has no key for
+# CapDrop / NoHosts / Init / SecurityOpt, so they are passed through PodmanArgs.
+# (--no-new-privileges is not a podman CLI flag; --security-opt= is.)
+ReadOnly=true
+Tmpfs=/tmp:rw,size=512m,mode=1777
+Tmpfs=/home/dshuser/.local:rw,size=512m,mode=1777
+PidsLimit=256
+Memory=4G
+Mask=/proc/kcore
+Mask=/proc/sched_debug
+Label=io.deepseek.sandbox=true
+PodmanArgs=--cap-drop=ALL --security-opt=no-new-privileges --no-hosts --init --sysctl=net.ipv4.ip_forward=0
+
+# The image ships /usr/local/lib/healthcheck.mjs: it probes the interface address
+# dsh binds (loopback is never bound, so a 127.0.0.1 probe always fails). Any
+# sub-500 status is healthy; unauthenticated requests answer 401.
+# HEALTHCHECK in the Containerfile is dropped by podman for OCI images, so the
+# check has to be declared here.
+HealthCmd=node /usr/local/lib/healthcheck.mjs
+HealthInterval=30s
+HealthTimeout=5s
+HealthStartPeriod=30s
+HealthRetries=3
+HealthOnFailure=kill
+
+[Service]
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=5
+# systemd-level caps (the [Container] keys above are podman flags). MemoryMax is
+# set above Memory so podman's own limit stays the effective one and cgroup
+# overhead does not trigger a systemd kill.
+MemoryMax=5G
+MemorySwapMax=0
+CPUQuota=200%
+TasksMax=512
+LimitNOFILE=65536
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

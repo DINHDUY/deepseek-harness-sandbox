@@ -1,0 +1,19 @@
+# Non-destructive by design: only dangling (untagged) images and the build cache
+# are removed, so the tagged base image and `localhost/deepseek-harness:latest`
+# always survive. `make prune-all` is the opt-in destructive variant.
+#
+# quadlet-install rewrites /usr/bin/podman to the podman found on this host, so
+# the unit also works on distros that keep it elsewhere.
+[Unit]
+Description=Prune dangling Podman images and build cache
+
+[Service]
+Type=oneshot
+# Bounded so a prune can never starve the running harness of CPU or memory.
+Nice=19
+IOSchedulingClass=idle
+MemoryMax=1G
+CPUQuota=100%
+TimeoutStartSec=600
+ExecStart=/usr/bin/podman image prune -f
+ExecStart=/usr/bin/podman builder prune -f

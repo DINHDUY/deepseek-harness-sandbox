@@ -1,0 +1,76 @@
+# Local development stack. Hardened like `make sandbox-run`, but on its own
+# network and volume so it can never touch the Quadlet service's state.
+# For the production path use `make quadlet-install` (see quadlet/).
+services:
+  harness:
+    image: localhost/deepseek-harness:latest
+    build:
+      context: .
+      dockerfile: Containerfile
+    ports:
+      - "127.0.0.1:${WEB_PORT:-8081}:8080"   # dsh web, loopback only (8080 is used by `make sandbox-run`)
+    environment:
+      # Pass-through: set in your shell to inject, or leave unset and enter the
+      # key in the web Models page after the app starts. Keys are optional.
+      DEEPSEEK_API_KEY:
+      DSH_WEB_SEARCH_PROVIDER:
+      EXA_API_KEY:
+    volumes:
+      - deepseek-harness-dev-data:/home/dshuser/data
+    networks:
+      - default
+    # Same hardening as the sandbox/Quadlet paths.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges
+      - mask=/proc/kcore
+      - mask=/proc/sched_debug
+    x-podman.no_hosts: true
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,size=512m,mode=1777
+      - /home/dshuser/.local:rw,size=512m,mode=1777
+    pids_limit: 256
+    sysctls:
+      net.ipv4.ip_forward: "0"
+    mem_limit: 4g
+    cpus: 2
+    labels:
+      io.deepseek.sandbox: "true"
+    healthcheck:
+      # Probes the interface address dsh binds; loopback is never bound.
+      test: ["CMD", "node", "/usr/local/lib/healthcheck.mjs"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    restart: unless-stopped
+
+networks:
+  default:
+    name: dsh-compose-net
+    ipam:
+      config:
+        - subnet: 10.89.204.0/24
+          gateway: 10.89.204.1
+    # Egress isolation, same set as BLOCKED_SUBNETS in the Makefile: the LAN, the
+    # podman-machine gvproxy net (its .254 forwards to the Mac's loopback),
+    # link-local, and every RFC1918/CGNAT range. This stack's own subnet keeps a
+    # more specific connected route, so its gateway and published ports still work.
+    # x-podman.routes is the only way to express repeated --route here: plain
+    # driver_opts puts each key in its own --opt and podman rejects that.
+    # To let this stack reach one LAN host, append "<ip>/32,10.89.204.1".
+    x-podman.routes:
+      - 192.168.1.0/24,blackhole
+      - 192.168.127.0/24,blackhole
+      - 169.254.0.0/16,blackhole
+      - 10.0.0.0/8,blackhole
+      - 172.16.0.0/12,blackhole
+      - 192.168.0.0/16,blackhole
+      - 100.64.0.0/10,blackhole
+
+volumes:
+  deepseek-harness-dev-data:
+    name: deepseek-harness-dev-data   # {project}-{service}-{type}; prod uses -prod-data
