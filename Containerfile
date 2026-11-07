@@ -9,6 +9,8 @@ ARG NODE_IMAGE=docker.io/library/node:24-slim@sha256:01d566e8d94d8c619591d78652b
 # compromised dependency cannot execute during the build. node-pty and koffi
 # ship prebuilt binaries for every platform, so nothing needs to be compiled.
 # ---------------------------------------------------------------------------
+# NODE_IMAGE is tagged and digest-pinned above; Hadolint cannot resolve ARGs.
+# hadolint ignore=DL3006
 FROM ${NODE_IMAGE} AS deps
 
 WORKDIR /build
@@ -25,6 +27,7 @@ RUN npm ci --omit=dev --ignore-scripts
 # Stage 2: runtime. Only node_modules and the generated bin shim are copied,
 # so build-time provenance (and any tampered copy) does not persist.
 # ---------------------------------------------------------------------------
+# hadolint ignore=DL3006
 FROM ${NODE_IMAGE} AS runtime
 
 ARG DSH_VERSION=0.2.2-rc.1
