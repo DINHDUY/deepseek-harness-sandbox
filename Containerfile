@@ -2,7 +2,7 @@
 
 # Pinned by content digest (multi-arch index: linux/amd64 + linux/arm64).
 # Bump deliberately: `make digest-check` prints the current tag digests.
-ARG NODE_IMAGE=docker.io/library/node:24-slim@sha256:01d566e8d94d8c619591d78652babfccd3c6992a3dffa9ed5ab39e11cf6c70e9
+ARG NODE_IMAGE=docker.io/library/node:24-slim@sha256:dc26ae92c9fb15cf6b1d63e20f0944b2efe0f115b20e00be48fb23fceb061c54
 
 # ---------------------------------------------------------------------------
 # Stage 1: resolve dependencies from the lockfile only. No scripts run, so a
@@ -51,6 +51,14 @@ ENV DSH_HOME=/home/dshuser/data/dsh \
     NPM_CONFIG_FUND=false \
     NPM_CONFIG_AUDIT=false
 
+# No `apt-get upgrade` here, deliberately. Upgrading OS packages at build time
+# would make the image non-reproducible: the same Containerfile and the same
+# digest pin would produce different bytes on different dates, which defeats the
+# point of pinning by digest (a rebuild must reproduce a known image exactly).
+# Patch currency comes from bumping the pin above instead, and that is now
+# enforced rather than advisory: `make digest-check` pulls the live tag and exits
+# non-zero on drift, and CI runs the same comparison on every push.
+#
 # --shell nologin: the sandbox account can never be used as a login target.
 RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin dshuser \
     && mkdir -p /home/dshuser/data \

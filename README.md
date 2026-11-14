@@ -31,14 +31,16 @@ you give it, so a mistake or an attack is contained to that container instead of
 `npm ci --omit=dev --ignore-scripts`, so dependency install scripts never execute and dev-only packages
 never enter the image. `overrides` in `package.json` force the transitive dependencies that had published
 advisories (undici, zod, fflate, `@modelcontextprotocol/client`) to patched versions; `npm ci` fails if the
-lockfile disagrees with `package.json`. The base image is pinned by content digest
-(`make digest-check` prints the current one). Check the tree with `make audit`; CI runs the same audit and
-fails on anything high or critical.
+lockfile disagrees with `package.json`. The base image is pinned by content digest, and
+`make digest-check` fails if that pin no longer matches what the registry serves for the tag — CI runs it
+on a weekly schedule, so a stale pin surfaces as a red build rather than silently eroding the pin. Check the
+dependency tree with `make audit`; CI runs the same audit and fails on anything high or critical.
 
 ## What makes it safe?
 
-Defense in depth; each layer limits what happens if the one above it fails. All three run paths
-(`make sandbox-run`, `podman-compose.yml`, and the Quadlet service) apply the same set.
+Defense in depth; each layer limits what happens if the one above it fails. All four run paths
+(`make run`, `make sandbox-run`, `podman-compose.yml`, and the Quadlet service) apply the same set,
+including the isolated network with its egress blackholes.
 
 | Layer | What it does | Where |
 |-------|--------------|-------|
@@ -89,8 +91,11 @@ Defense in depth; each layer limits what happens if the one above it fails. All 
 ├── scripts/
 │   ├── entrypoint.sh              # Binds dsh web to the container IP (wildcards rejected)
 │   ├── container-ip.mjs           # Resolves that IP; exits non-zero if there is none
-│   └── healthcheck.mjs            # Probes the same address from inside the container
-├── .github/workflows/ci.yml       # audit, quadlet validation, lint, secret scan, build
+│   ├── healthcheck.mjs            # Probes the same address from inside the container
+│   ├── net-reconcile.sh           # Recreates a network whose routes drifted from policy
+│   ├── digest-check.sh            # Registry query that gates the base-image pin
+│   └── compose-routes-check.sh    # Asserts compose routes == Makefile BLOCKED_SUBNETS
+└── .github/workflows/ci.yml       # audit, pin gate, policy parity, quadlet, lint, secret scan, build
 └── SECURITY.md                    # Threat model limits, disclosure, key rotation
 ```
 
@@ -168,8 +173,11 @@ make sandbox-stop
 
 `--userns=keep-id` is not used on macOS (Podman runs in a Linux VM).
 
-Notes: routes are fixed when the network is created, so run `make sandbox-stop` before changing
-`LAN_SUBNET`/`BLOCKED_SUBNETS`/`ALLOWED_HOSTS`.
+Notes: the egress routes are enforced, not advisory. `make sandbox-net` (and its siblings) reconciles the
+network against `BLOCKED_SUBNETS`/`ALLOWED_HOSTS` and recreates it when the routes have drifted; it refuses
+to do so while containers are still attached, which is why the target depends on a stopped sandbox. Run
+`make netcheck` to diff every network against policy without changing anything. Pass `LAN_SUBNET` to widen
+the blackhole to your router's subnet.
 
 The sandbox may reach only the LAN hosts in `ALLOWED_HOSTS` (default `192.168.1.219`; the
 `/32` route is more specific than the LAN blackhole). Routes can't filter by port, so every
@@ -197,7 +205,9 @@ at the filesystem level (create the volume with `--opt o=...` on a loop device, 
 
 ```sh
 make audit          # npm audit on the pinned tree (dev deps excluded)
-make digest-check   # current base-image digests for the Containerfile pin
+make digest-check   # gate: does the Containerfile pin still match the registry?
+make netpolicy      # gate: compose routes == BLOCKED_SUBNETS, every network path reconciles
+make netcheck       # diff every podman network's live routes against policy (changes nothing)
 make validate       # run the real quadlet generator over quadlet/
 make prune          # dangling images + build cache only (keeps tagged images)
 make prune-all      # ALL unused images, including base images (asks first)

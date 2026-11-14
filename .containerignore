@@ -5,3 +5,14 @@ quadlet/
 podman-compose.yml
 .tmp-*
 node_modules/
+
+# Defence in depth: the Containerfile COPYs only explicit paths, so nothing here
+# can reach a layer today. These mirror .gitignore so a future broad COPY cannot
+# pull secrets into the build context.
+.env
+.env.*
+*.env
+secrets/
+*.pem
+*.key
+*.log

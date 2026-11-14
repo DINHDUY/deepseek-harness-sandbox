@@ -5,7 +5,7 @@
 `dsh` is an autonomous agent: it reads files, runs shell commands, and fetches
 URLs chosen by the model. Treat every container running it as **already
 compromised** and design around containing the blast radius, not preventing
-compromise. The three run paths (`make sandbox-run`, `podman-compose.yml`, and
+compromise. The four run paths (`make run`, `make sandbox-run`, `podman-compose.yml`, and
 the Quadlet service) all apply the same controls:
 
 | Control | Why |
@@ -13,7 +13,7 @@ the Quadlet service) all apply the same controls:
 | `--cap-drop=ALL`, `--security-opt=no-new-privileges` | No setuid/setgid escalation, no raw sockets, no module loading. |
 | `--read-only` rootfs + tmpfs for `/tmp` | Persisted changes must land in the agent's own data volume, nowhere else. |
 | Own network + own volume per run path | A dev container can never read or corrupt the production agent's state. |
-| Egress blackhole routes | Blocks the LAN, the podman-machine gateway that forwards into the Mac's loopback, link-local, and every RFC1918/CGNAT range. Only the internet and `ALLOWED_HOSTS` are reachable. |
+| Egress blackhole routes | Blocks the LAN, the podman-machine gateway that forwards into the Mac's loopback, link-local, and every RFC1918/CGNAT range. Only the internet and `ALLOWED_HOSTS` are reachable. The routes are reconciled, not set-and-forgotten: `make netcheck` diffs every network against policy and the `*-net` targets recreate a network whose routes have drifted. |
 | `--no-hosts` | The container cannot read the host's `/etc/hosts`. |
 | `--pids-limit`, `--memory`, `--cpus`, systemd `TasksMax`/`MemoryMax` | Contains fork bombs and memory exhaustion. |
 | `npm ci --ignore-scripts`, digest-pinned base image | Dependencies cannot run code at install time, and the base cannot be silently swapped. |
@@ -61,14 +61,23 @@ exact command. Expect a response within 7 days.
 
 ## Rotating a leaked secret
 
+Agent state — launch tokens, conversation history, and any key you entered in the web UI —
+lives in named volumes, and a volume outlives the container and network that used it. Enumerate
+them before you declare a rotation complete; deleting only the one you remember leaves the rest
+readable by any container you start later.
+
 ```sh
-# 1. Stop the agent and destroy its state (the token and history live in the volume).
+# 1. List every volume this project has ever created, and what is in each.
+podman volume ls --filter name=deepseek-harness
+podman run --rm -v <volume>:/v:ro alpine find /v -name '.credentials*'
+
+# 2. Stop the agent, then destroy the state (tokens and history live in the volume).
 make sandbox-stop SANDBOX_NAME=dsh-sandbox SANDBOX_NET=dsh-mac-net
-podman volume rm deepseek-harness-dev-data
+podman volume rm deepseek-harness-dev-data   # and any orphan the listing turned up
 
-# 2. Issue a new API key at the provider and update your environment.
+# 3. Issue a new API key at the provider and update your environment.
 
-# 3. Restart; a fresh launch token is generated on start.
+# 4. Restart; a fresh launch token is generated on start.
 make sandbox-run
 ```
 

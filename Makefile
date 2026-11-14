@@ -69,11 +69,21 @@ define check_host
 	case "$(1)" in *[!0-9a-zA-Z._-]*) echo "invalid host: $(1)" >&2; exit 1;; esac
 endef
 
+# Create the network, or recreate it if its live routes no longer match the
+# declared policy. podman only accepts --route at create time, so a network
+# created under an older BLOCKED_SUBNETS list would otherwise be reused forever.
+define reconcile_net
+	@$(call check_subnet,$(2))
+	@$(call check_subnet,$(3))
+	@$(foreach h,$(ALLOWED_HOSTS),$(call check_host,$(h));)
+	@PODMAN=$(PODMAN) scripts/net-reconcile.sh $(1) $(2) $(3) "$(BLOCKED_SUBNETS)" "$(ALLOWED_HOSTS)"
+endef
+
 QUADLET_DIR := $(HOME)/.config/containers/systemd
 SYSTEMD_DIR := $(HOME)/.config/systemd/user
 
 .DEFAULT_GOAL := help
-.PHONY: help build run up down logs compose-net sandbox-net sandbox-run sandbox-url sandbox-open sandbox-logs sandbox-stop quadlet-net quadlet-install quadlet-start quadlet-stop quadlet-url quadlet-uninstall prune audit digest-check validate
+.PHONY: help build run up down logs compose-net sandbox-net sandbox-run sandbox-url sandbox-open sandbox-logs sandbox-stop quadlet-net quadlet-install quadlet-start quadlet-stop quadlet-url quadlet-uninstall prune audit netpolicy netcheck digest-check validate
 
 ##@ General
 help: ## Show this help
@@ -112,8 +122,15 @@ build: ## Build the OCI image
 		--build-arg VCS_REF=$$(git rev-parse --short HEAD 2>/dev/null || echo unknown) \
 		--build-arg BUILD_DATE=$$(date -u +%Y-%m-%dT%H:%M:%SZ) .
 
-run: build ## Run `dsh web` in the foreground, hardened (keys optional; set in the web UI)
-	$(PODMAN) run --rm -it -p 127.0.0.1:$(WEB_PORT):8080 \
+# `run` is the interactive foreground path. It joins the same isolated network as
+# `sandbox-run` (and the same dev volume), so it carries the identical egress
+# policy: without --network it would silently land on the default `podman`
+# bridge, which has no blackhole routes and can reach the LAN and, through the
+# gvproxy gateway, the host's own loopback.
+run: build sandbox-net ## Run `dsh web` in the foreground, hardened (keys optional; set in the web UI)
+	$(PODMAN) run --rm -it \
+		--network=$(SANDBOX_NET) \
+		-p 127.0.0.1:$(WEB_PORT):8080 \
 		$(HARDEN) $(HC) \
 		--memory=8g --cpus=4 \
 		-v $(DEV_VOLUME):/home/dshuser/data \
@@ -122,15 +139,7 @@ run: build ## Run `dsh web` in the foreground, hardened (keys optional; set in t
 
 ##@ Compose (local development)
 compose-net: ## Create the compose network with the same egress routes as sandbox-net
-	@$(call check_subnet,$(COMPOSE_SUBNET))
-	@$(call check_subnet,$(COMPOSE_GATEWAY))
-	@$(foreach h,$(ALLOWED_HOSTS),$(call check_host,$(h));)
-	@$(PODMAN) network exists $(COMPOSE_NET) || { \
-		args=""; \
-		for s in $(BLOCKED_SUBNETS); do args="$$args --route $$s,blackhole"; done; \
-		for h in $(ALLOWED_HOSTS); do args="$$args --route $$h/32,$(COMPOSE_GATEWAY)"; done; \
-		$(PODMAN) network create --subnet $(COMPOSE_SUBNET) --gateway $(COMPOSE_GATEWAY) $$args $(COMPOSE_NET); \
-	}
+	$(call reconcile_net,$(COMPOSE_NET),$(COMPOSE_SUBNET),$(COMPOSE_GATEWAY))
 
 up: compose-net ## Build and start the stack with podman-compose
 	$(COMPOSE) up -d --build
@@ -143,15 +152,7 @@ logs: ## Tail compose logs (launch token is redacted)
 
 ##@ Hardened sandbox (macOS)
 sandbox-net: ## Create the isolated network: blackhole LAN/private ranges, allow only ALLOWED_HOSTS
-	@$(call check_subnet,$(SANDBOX_SUBNET))
-	@$(call check_subnet,$(SANDBOX_GATEWAY))
-	@$(foreach h,$(ALLOWED_HOSTS),$(call check_host,$(h));)
-	@$(PODMAN) network exists $(SANDBOX_NET) || { \
-		args=""; \
-		for s in $(BLOCKED_SUBNETS); do args="$$args --route $$s,blackhole"; done; \
-		for h in $(ALLOWED_HOSTS); do args="$$args --route $$h/32,$(SANDBOX_GATEWAY)"; done; \
-		$(PODMAN) network create --subnet $(SANDBOX_SUBNET) --gateway $(SANDBOX_GATEWAY) $$args $(SANDBOX_NET); \
-	}
+	$(call reconcile_net,$(SANDBOX_NET),$(SANDBOX_SUBNET),$(SANDBOX_GATEWAY))
 
 # API keys are OPTIONAL. If DEEPSEEK_API_KEY / EXA_API_KEY are set in your shell they are
 # passed through (never put them in this file); if not, the container still starts and you
@@ -192,15 +193,7 @@ sandbox-stop: ## Remove the sandbox container and its network
 # Quadlet has no Route= key, so the isolated network is created here and only
 # referenced by name from the .container unit.
 quadlet-net: ## Create the Quadlet network with the same egress routes as sandbox-net
-	@$(call check_subnet,$(PROD_SUBNET))
-	@$(call check_subnet,$(PROD_GATEWAY))
-	@$(foreach h,$(ALLOWED_HOSTS),$(call check_host,$(h));)
-	@$(PODMAN) network exists $(PROD_NET) || { \
-		args=""; \
-		for s in $(BLOCKED_SUBNETS); do args="$$args --route $$s,blackhole"; done; \
-		for h in $(ALLOWED_HOSTS); do args="$$args --route $$h/32,$(PROD_GATEWAY)"; done; \
-		$(PODMAN) network create --subnet $(PROD_SUBNET) --gateway $(PROD_GATEWAY) $$args $(PROD_NET); \
-	}
+	$(call reconcile_net,$(PROD_NET),$(PROD_SUBNET),$(PROD_GATEWAY))
 
 quadlet-install: build quadlet-net ## Install Quadlet units and prune timer (rootless)
 	mkdir -p $(QUADLET_DIR) $(SYSTEMD_DIR)
@@ -216,7 +209,11 @@ quadlet-install: build quadlet-net ## Install Quadlet units and prune timer (roo
 	cp quadlet/*.container quadlet/*.volume $(QUADLET_DIR)/
 	# The units hardcode /usr/bin/podman; point it at this host's podman so the
 	# timer still works where podman lives elsewhere (e.g. /usr/local/bin).
-	sed "s|/usr/bin/podman|$(shell command -v podman)|" quadlet/podman-prune.service > $(SYSTEMD_DIR)/podman-prune.service
+	# Fail closed: an empty substitution would leave ExecStart= blank and a unit
+	# that systemd accepts but can never run.
+	@podman_path=$$(command -v podman); \
+	if [ -z "$$podman_path" ]; then echo "podman not found on PATH; cannot install the prune unit" >&2; exit 1; fi; \
+	sed "s|/usr/bin/podman|$$podman_path|" quadlet/podman-prune.service > $(SYSTEMD_DIR)/podman-prune.service
 	cp quadlet/podman-prune.timer $(SYSTEMD_DIR)/
 	systemctl --user daemon-reload
 	systemctl --user enable --now podman-prune.timer
@@ -263,11 +260,32 @@ validate: ## Check Quadlet units against this podman's generator (in the VM)
 audit: ## Audit the pinned dependency tree (dev dependencies excluded)
 	npm audit --omit=dev --audit-level=high
 
-digest-check: ## Print current base-image digests for the Containerfile pin
-	@for img in docker.io/library/node:24-slim; do \
-		d=$$($(PODMAN) image inspect $$img --format '{{join .RepoDigests "\n"}}' 2>/dev/null | head -1); \
-		echo "$$img -> $${d:-not pulled; run: $(PODMAN) pull $$img}"; \
+# Fail closed on egress drift: a network created under an older BLOCKED_SUBNETS
+# list is otherwise reused silently, and the sandbox loses blackholes it claims.
+# Static, needs no daemon: safe for CI. Asserts the two copies of the egress
+# policy agree and that the network targets use the reconciling helper.
+netpolicy: ## Verify the egress policy agrees across Makefile and compose
+	@echo "podman-compose.yml vs BLOCKED_SUBNETS:"
+	@scripts/compose-routes-check.sh "$(BLOCKED_SUBNETS)" podman-compose.yml
+	@echo "network targets wired to scripts/net-reconcile.sh:"
+	@for t in compose-net sandbox-net quadlet-net; do \
+		$(MAKE) -n $$t | grep -q 'net-reconcile.sh' || \
+			{ echo "  $$t no longer reconciles routes" >&2; exit 1; }; \
+		echo "  $$t ok"; \
 	done
+
+netcheck: netpolicy ## Verify every sandbox network's live routes match the declared policy
+	@rc=0; \
+	for spec in "$(SANDBOX_NET) $(SANDBOX_SUBNET) $(SANDBOX_GATEWAY)" \
+	            "$(COMPOSE_NET) $(COMPOSE_SUBNET) $(COMPOSE_GATEWAY)" \
+	            "$(PROD_NET) $(PROD_SUBNET) $(PROD_GATEWAY)"; do \
+		set -- $$spec; \
+		$(PODMAN) network exists $$1 >/dev/null 2>&1 || { echo "$$1: not created (skipped)"; continue; }; \
+		CHECK_ONLY=1 PODMAN=$(PODMAN) scripts/net-reconcile.sh $$1 $$2 $$3 "$(BLOCKED_SUBNETS)" "$(ALLOWED_HOSTS)" || rc=1; \
+	done; exit $$rc
+
+digest-check: ## Query the registry for the live base digest and gate the pin
+	@BASE_IMAGE=docker.io/library/node:24-slim scripts/digest-check.sh $(CONTAINERFILE)
 
 prune: ## Remove dangling images and build cache (keeps tagged images)
 	$(PODMAN) image prune -f

@@ -4,6 +4,10 @@ on:
   push:
     branches: [master, main]
   pull_request:
+  # Base images drift without a commit, so check the pin on a schedule too.
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -12,8 +16,8 @@ jobs:
   supply-chain:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.1.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.0.4
         with:
           node-version: '24'
           cache: npm
@@ -27,36 +31,44 @@ jobs:
   quadlet:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.1.1
       # Validate the units against a real quadlet generator. --dryrun only prints
       # the generated units, it does not start anything.
       - name: Validate Quadlet units
         run: |
           mkdir -p ~/.config/containers/systemd
           cp quadlet/*.container quadlet/*.volume ~/.config/containers/systemd/
-          out=$(/usr/libexec/podman/quadlet --user --dryrun 2>&1 | grep -iE 'unsupported|error' || true)
-          if [ -n "$out" ]; then echo "$out"; exit 1; fi
+          # Capture the generator's real output and exit status. Piping through
+          # grep (with `|| true`) used to swallow a generator failure whose
+          # message happened to lack "unsupported"/"error".
+          out=$(/usr/libexec/podman/quadlet --user --dryrun 2>&1); rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::quadlet generator exited $rc"; echo "$out"; exit 1
+          fi
+          if printf '%s' "$out" | grep -qiE 'unsupported|error'; then
+            echo "::error::quadlet generator reported a problem"; echo "$out"; exit 1
+          fi
           echo "quadlet units OK"
 
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.1.1
       - name: shellcheck
         run: shellcheck -x scripts/*.sh
       - name: hadolint Containerfile
-        uses: hadolint/hadolint-action@v3.1.0
+        uses: hadolint/hadolint-action@54c9adbab1582c2ef04b2016b760714a4bfde3cf # v3.1.0
         with:
           dockerfile: Containerfile
 
   secrets:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.1.1
         with:
           fetch-depth: 0
       # Fails on any API key, token, or private key committed to history.
-      - uses: gitleaks/gitleaks-action@v2
+      - uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -64,7 +76,7 @@ jobs:
     needs: [supply-chain, quadlet]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.1.1
       # GitHub's runners have docker, not podman; the Containerfile is portable.
       - name: Build image
         run: make build PODMAN=docker IMAGE=localhost/deepseek-harness:ci
@@ -79,14 +91,10 @@ jobs:
           fi
           docker run --rm localhost/deepseek-harness:ci --version
       - name: Verify base-image digest pin is current
-        run: |
-          pin=$(sed -n 's|^ARG NODE_IMAGE=docker\.io/library/node:24-slim@\(sha256:[0-9a-f]*\).*|\1|p' Containerfile)
-          test -n "$pin" || { echo "::error::Containerfile base image is not digest-pinned"; exit 1; }
-          docker pull docker.io/library/node:24-slim
-          live=$(docker image inspect docker.io/library/node:24-slim --format '{{join .RepoDigests "\n"}}' | head -1 | sed 's/.*@//')
-          echo "Containerfile pin: $pin"
-          echo "live tag digest:   $live"
-          if [ "$pin" != "$live" ]; then
-            echo "::error::Containerfile base pin is stale. Run 'make digest-check' and update the pin."
-            exit 1
-          fi
+        run: make digest-check CONTAINERFILE=Containerfile
+      # The egress policy lives in two places (Makefile + podman-compose.yml);
+      # assert they still agree, and that the CLI network targets are wired to
+      # the reconciling helper rather than the old create-only form. Static:
+      # needs no daemon, so it runs before the build job's networks exist.
+      - name: Verify egress policy is consistent
+        run: make netpolicy
